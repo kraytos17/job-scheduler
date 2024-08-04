@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,25 +7,41 @@ use std::thread;
 type JobId = usize;
 type JobFn = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Debug, Clone)]
 struct Job {
-    _id: JobId,
+    id: JobId,
     deps: HashSet<JobId>,
-    func: JobFn,
+    priority: usize,
 }
 
-#[derive(Debug, PartialEq)]
-enum JobStatus {
-    Pending,
-    Running,
-    Completed,
+impl Ord for Job {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.priority.cmp(&self.priority)
+    }
 }
+
+impl PartialOrd for Job {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Job {}
 
 pub struct JobScheduler {
     jobs: HashMap<JobId, Job>,
     job_statuses: Arc<Mutex<HashMap<JobId, JobStatus>>>,
-    ready_jobs: VecDeque<JobId>,
+    ready_jobs: BinaryHeap<Job>,
+    ready_job_ids: HashSet<JobId>,
     next_id: JobId,
     threadpool: ThreadPool,
+    job_funcs: HashMap<JobId, JobFn>,
 }
 
 impl JobScheduler {
@@ -32,22 +49,24 @@ impl JobScheduler {
         JobScheduler {
             jobs: HashMap::new(),
             job_statuses: Arc::new(Mutex::new(HashMap::new())),
-            ready_jobs: VecDeque::new(),
+            ready_jobs: BinaryHeap::new(),
+            ready_job_ids: HashSet::new(),
             next_id: 0,
             threadpool: ThreadPool::new(count),
+            job_funcs: HashMap::new(),
         }
     }
 
-    pub fn add_job<F>(&mut self, deps: Vec<JobId>, func: F) -> JobId
+    pub fn add_job<F>(&mut self, deps: Vec<JobId>, func: F, priority: usize) -> JobId
     where
         F: FnOnce() + Send + 'static,
     {
         let id = self.next_id;
         self.next_id += 1;
         let job = Job {
-            _id: id,
+            id,
             deps: deps.into_iter().collect(),
-            func: Box::new(func),
+            priority,
         };
 
         self.job_statuses
@@ -55,14 +74,18 @@ impl JobScheduler {
             .unwrap()
             .insert(id, JobStatus::Pending);
 
-        if job.deps.is_empty() {
-            self.ready_jobs.push_back(id);
+        if job.deps.is_empty() && !self.ready_job_ids.contains(&id) {
+            self.ready_jobs.push(job.clone());
+            self.ready_job_ids.insert(id);
+            println!("Job {} (priority {}) is now ready to run", id, job.priority);
         }
-        self.jobs.insert(id, job);
+        self.jobs.insert(id, job.clone());
+        self.job_funcs.insert(id, Box::new(func));
 
         println!(
-            "Added job {}: {:?}",
+            "Added job {}: Priority {}, Status: {:?}",
             id,
+            job.priority,
             self.job_statuses.lock().unwrap().get(&id)
         );
 
@@ -71,32 +94,36 @@ impl JobScheduler {
 
     pub fn run(&mut self) {
         while !self.ready_jobs.is_empty() || !self.jobs.is_empty() {
-            let jobs_to_run: Vec<JobId> = self.ready_jobs.drain(..).collect();
+            let jobs_to_run: Vec<Job> = self.ready_jobs.drain().collect();
 
-            for job_id in jobs_to_run {
-                if let Some(job) = self.jobs.remove(&job_id) {
+            for job in jobs_to_run {
+                if let Some(job_func) = self.job_funcs.remove(&job.id) {
                     let job_statuses = Arc::clone(&self.job_statuses);
+                    println!(
+                        "Dispatching Job {} (priority {}) to threadpool",
+                        job.id, job.priority
+                    );
                     self.threadpool.execute(move || {
                         {
                             let mut statuses = job_statuses.lock().unwrap();
-                            if let Some(status) = statuses.get_mut(&job_id) {
+                            if let Some(status) = statuses.get_mut(&job.id) {
                                 *status = JobStatus::Running;
                             }
-                            println!("Job {} is now running", job_id);
+                            println!("Job {} is now running", job.id);
                         }
 
-                        (job.func)();
+                        (job_func)();
 
                         {
                             let mut statuses = job_statuses.lock().unwrap();
-                            if let Some(status) = statuses.get_mut(&job_id) {
+                            if let Some(status) = statuses.get_mut(&job.id) {
                                 *status = JobStatus::Completed;
                             }
-                            println!("Job {} has completed", job_id);
+                            println!("Job {} has completed", job.id);
                         }
                     });
                 } else {
-                    println!("Warning: Job {} not found", job_id);
+                    println!("Warning: Job {} function not found", job.id);
                 }
             }
 
@@ -121,22 +148,26 @@ impl JobScheduler {
         let job_statuses = self.job_statuses.lock().unwrap();
         let mut new_ready_jobs = Vec::new();
 
-        for (&job_id, job) in &self.jobs {
+        for (_, job) in &self.jobs {
             if job
                 .deps
                 .iter()
                 .all(|&dep_id| matches!(job_statuses.get(&dep_id), Some(JobStatus::Completed)))
             {
-                new_ready_jobs.push(job_id);
+                new_ready_jobs.push(job.clone());
             }
         }
 
         drop(job_statuses);
 
-        for job_id in new_ready_jobs {
-            if !self.ready_jobs.contains(&job_id) {
-                self.ready_jobs.push_back(job_id);
-                println!("Job {} is now ready to run", job_id);
+        for job in new_ready_jobs {
+            if !self.ready_job_ids.contains(&job.id) {
+                self.ready_jobs.push(job.clone());
+                self.ready_job_ids.insert(job.id);
+                println!(
+                    "Job {} (priority {}) is now ready to run",
+                    job.id, job.priority
+                );
             }
         }
     }
@@ -150,6 +181,13 @@ struct ThreadPool {
 enum Message {
     NewJob(JobFn),
     Terminate,
+}
+
+#[derive(Debug, PartialEq)]
+enum JobStatus {
+    Pending,
+    Running,
+    Completed,
 }
 
 impl ThreadPool {
