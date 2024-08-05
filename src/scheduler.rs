@@ -1,10 +1,12 @@
+use crossbeam::channel::{self, Sender};
+use crossbeam::queue::SegQueue;
+use crossbeam::sync::ShardedLock;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::panic::AssertUnwindSafe;
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{panic, thread};
 
 type JobId = usize;
 type JobFn = Box<dyn FnOnce() + Send + 'static>;
@@ -40,10 +42,10 @@ impl Eq for Job {}
 
 pub struct JobScheduler {
     jobs: HashMap<JobId, Job>,
-    job_statuses: Arc<Mutex<HashMap<JobId, JobStatus>>>,
+    job_statuses: Arc<ShardedLock<HashMap<JobId, JobStatus>>>,
     job_retries: HashMap<JobId, usize>,
     max_retries: usize,
-    ready_jobs: BinaryHeap<Job>,
+    ready_jobs: Arc<SegQueue<Job>>,
     ready_job_ids: HashSet<JobId>,
     next_id: JobId,
     threadpool: ThreadPool,
@@ -55,12 +57,12 @@ impl JobScheduler {
     pub fn new(count: usize, max_retries: usize) -> Self {
         JobScheduler {
             jobs: HashMap::new(),
-            job_statuses: Arc::new(Mutex::new(HashMap::new())),
+            job_statuses: Arc::new(ShardedLock::new(HashMap::new())),
             job_retries: HashMap::new(),
             max_retries,
-            ready_jobs: BinaryHeap::new(),
+            ready_jobs: Arc::new(SegQueue::new()),
             ready_job_ids: HashSet::new(),
-            next_id: 0,
+            next_id: 1,
             threadpool: ThreadPool::new(count),
             job_funcs: HashMap::new(),
             cancel_callback: None,
@@ -74,7 +76,13 @@ impl JobScheduler {
         self.cancel_callback = Some(Box::new(callback));
     }
 
-    pub fn add_job<F>(&mut self, deps: Vec<JobId>, func: F, priority: usize, timeout: Duration) -> JobId
+    pub fn add_job<F>(
+        &mut self,
+        deps: Vec<JobId>,
+        func: F,
+        priority: usize,
+        timeout: Duration,
+    ) -> JobId
     where
         F: FnOnce() + Send + 'static,
     {
@@ -88,7 +96,7 @@ impl JobScheduler {
         };
 
         self.job_statuses
-            .lock()
+            .write()
             .unwrap()
             .insert(id, JobStatus::Pending);
 
@@ -104,7 +112,7 @@ impl JobScheduler {
             "Added job {}: Priority {}, Status: {:?}",
             id,
             job.priority,
-            self.job_statuses.lock().unwrap().get(&id)
+            self.job_statuses.read().unwrap().get(&id)
         );
 
         id
@@ -112,7 +120,7 @@ impl JobScheduler {
 
     pub fn run(&mut self) {
         while !self.ready_jobs.is_empty() || !self.jobs.is_empty() {
-            let jobs_to_run: Vec<Job> = self.ready_jobs.drain().collect();
+            let jobs_to_run: Vec<Job> = self.ready_jobs.pop().into_iter().collect();
 
             for job in jobs_to_run {
                 if let Some(job_func) = self.job_funcs.remove(&job.id) {
@@ -130,7 +138,7 @@ impl JobScheduler {
 
                         let elapsed = start_time.elapsed();
                         {
-                            let mut statuses = job_statuses.lock().unwrap();
+                            let mut statuses = job_statuses.write().unwrap();
                             if result.is_err() {
                                 statuses.insert(job.id, JobStatus::Failed);
                             } else if timeout.map_or(false, |t| elapsed > t) {
@@ -160,7 +168,7 @@ impl JobScheduler {
 
         while self
             .job_statuses
-            .lock()
+            .read()
             .unwrap()
             .values()
             .any(|status| *status != JobStatus::Completed)
@@ -172,7 +180,7 @@ impl JobScheduler {
     }
 
     fn update_ready_jobs(&mut self) {
-        let job_statuses = self.job_statuses.lock().unwrap();
+        let job_statuses = self.job_statuses.read().unwrap();
         let mut new_ready_jobs = Vec::new();
 
         for (_, job) in &self.jobs {
@@ -201,10 +209,8 @@ impl JobScheduler {
 
     pub fn cancel_job(&mut self, job_id: JobId) {
         if let Some(_job) = self.jobs.remove(&job_id) {
-            self.ready_jobs.retain(|j| j.id != job_id);
-            self.ready_job_ids.remove(&job_id);
             self.job_statuses
-                .lock()
+                .write()
                 .unwrap()
                 .insert(job_id, JobStatus::Canceled);
 
@@ -236,13 +242,13 @@ impl JobScheduler {
                 self.ready_jobs.push(job.clone());
                 self.ready_job_ids.insert(job_id);
                 self.job_statuses
-                    .lock()
+                    .write()
                     .unwrap()
                     .insert(job_id, JobStatus::Pending);
                 println!("Retrying Job {} (attempt {})", job_id, *retry_count + 1);
             } else {
                 self.job_statuses
-                    .lock()
+                    .write()
                     .unwrap()
                     .insert(job_id, JobStatus::Failed);
                 println!(
@@ -274,14 +280,14 @@ enum JobStatus {
 
 impl ThreadPool {
     fn new(size: usize) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let receiver = Arc::new(Mutex::new(receiver));
+        let (sender, receiver) = channel::unbounded();
+        let receiver = Arc::new(ShardedLock::new(receiver));
         let mut workers = Vec::with_capacity(size);
 
         for i in 0..size {
             let receiver = Arc::clone(&receiver);
             let worker = thread::spawn(move || loop {
-                let msg = receiver.lock().unwrap().recv().unwrap();
+                let msg = receiver.read().unwrap().recv().unwrap();
                 match msg {
                     Message::NewJob(job) => {
                         println!("Worker {} received a new job", i);

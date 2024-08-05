@@ -1,47 +1,95 @@
 mod scheduler;
 
 use scheduler::JobScheduler;
+use std::sync::{Arc, Mutex};
+use std::thread::{self};
 use std::time::Duration;
 
 fn main() {
-    let mut scheduler = JobScheduler::new(4, 3);
-    scheduler.set_cancel_callback(|job_id| {
-        println!("Callback: Job {} was canceled", job_id);
+    let scheduler = Arc::new(Mutex::new(JobScheduler::new(4, 3)));
+    let scheduler_clone = Arc::clone(&scheduler);
+    scheduler_clone
+        .lock()
+        .unwrap()
+        .set_cancel_callback(|job_id| {
+            println!("Callback: Job {} was canceled", job_id);
+        });
+
+    let job1_id = {
+        let mut scheduler = scheduler.lock().unwrap();
+        scheduler.add_job(
+            vec![],
+            || {
+                println!("Job 1 running");
+                thread::sleep(Duration::from_secs(2));
+                println!("Job 1 completed");
+            },
+            1,
+            Duration::from_secs(5),
+        )
+    };
+
+    let job2_id = {
+        let mut scheduler = scheduler.lock().unwrap();
+        scheduler.add_job(
+            vec![],
+            || {
+                println!("Job 2 running");
+                thread::sleep(Duration::from_secs(3));
+                println!("Job 2 completed");
+            },
+            2,
+            Duration::from_secs(10),
+        )
+    };
+
+    let job3_id = {
+        let mut scheduler = scheduler.lock().unwrap();
+        scheduler.add_job(
+            vec![job1_id, job2_id],
+            || {
+                println!("Job 3 running (depends on Job 1 and Job 2)");
+                thread::sleep(Duration::from_secs(1));
+                println!("Job 3 completed");
+            },
+            3,
+            Duration::from_secs(5),
+        )
+    };
+
+    let job4_id = {
+        let mut scheduler = scheduler.lock().unwrap();
+        scheduler.add_job(
+            vec![job3_id],
+            || {
+                println!("Job 4 running (depends on Job 3)");
+                thread::sleep(Duration::from_secs(1));
+                println!("Job 4 completed");
+            },
+            1,
+            Duration::from_secs(5),
+        )
+    };
+
+    let scheduler_clone = Arc::clone(&scheduler);
+    let scheduler_handle = thread::spawn(move || {
+        let mut scheduler = scheduler_clone.lock().unwrap();
+        scheduler.run();
     });
 
-    let job0 = scheduler.add_job(
-        vec![],
-        || {
-            println!("Executing job 0");
-            std::thread::sleep(Duration::from_secs(2));
-        },
-        1,
-        Duration::from_secs(3),
-    );
+    thread::sleep(Duration::from_secs(1));
+    println!("Handling job failure for Job 3...");
+    {
+        let mut scheduler = scheduler.lock().unwrap();
+        scheduler.handle_job_failure(job3_id);
+    }
 
-    let job1 = scheduler.add_job(
-        vec![job0],
-        || {
-            println!("Executing job 1");
-            if rand::random::<bool>() {
-                panic!("Job 1 failed!");
-            }
-            std::thread::sleep(Duration::from_secs(2));
-        },
-        2,
-        Duration::from_secs(3),
-    );
+    thread::sleep(Duration::from_secs(1));
+    println!("Canceling Job 4...");
+    {
+        let mut scheduler = scheduler.lock().unwrap();
+        scheduler.cancel_job(job4_id);
+    }
 
-    let _job2 = scheduler.add_job(
-        vec![job1],
-        || {
-            println!("Executing job 2");
-            std::thread::sleep(Duration::from_secs(2));
-        },
-        3,
-        Duration::from_secs(3),
-    );
-
-    scheduler.run();
-    println!("All jobs have been processed");
+    scheduler_handle.join().unwrap();
 }
