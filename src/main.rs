@@ -6,44 +6,47 @@ use std::time::Duration;
 
 fn main() {
     let mut scheduler = JobScheduler::new(4, 3);
+    scheduler.set_cancel_callback(|job_id| {
+        println!("Notification: Job {} has been canceled", job_id);
+    });
 
-    let task1 = scheduler.add_job(
+    let job0 = scheduler.add_job(
         vec![],
         || {
-            println!("Task 1 executing");
+            println!("Job 0 executing");
             thread::sleep(Duration::from_secs(1));
         },
         1,
     );
 
-    let task2 = scheduler.add_job(
+    let job1 = scheduler.add_job(
         vec![],
         || {
-            println!("Task 2 executing");
+            println!("Job 1 executing");
             thread::sleep(Duration::from_secs(1));
         },
         2,
     );
 
-    let _task3 = scheduler.add_job(
-        vec![task1],
+    let job2 = scheduler.add_job(
+        vec![job0, job1],
         || {
-            println!("Task 3 executing (depends on 1 and 2)");
+            println!("Job 2 executing (depends on 0 and 1)");
             thread::sleep(Duration::from_secs(1));
         },
         3,
     );
 
-    let _task4 = scheduler.add_job(
-        vec![task2],
+    let _job3 = scheduler.add_job(
+        vec![job2],
         || {
-            println!("Task 4 executing (depends on 3)");
+            println!("Job 3 executing (depends on 2)");
             thread::sleep(Duration::from_secs(1));
         },
         4,
     );
 
-    scheduler.cancel_job(task2);
+    scheduler.cancel_job(job1);
     scheduler.run();
     println!("All tasks completed");
 }

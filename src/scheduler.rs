@@ -6,6 +6,7 @@ use std::thread;
 
 type JobId = usize;
 type JobFn = Box<dyn FnOnce() + Send + 'static>;
+type CancelFn = Box<dyn Fn(JobId) + Send + 'static>;
 
 #[derive(Debug, Clone)]
 struct Job {
@@ -44,6 +45,7 @@ pub struct JobScheduler {
     next_id: JobId,
     threadpool: ThreadPool,
     job_funcs: HashMap<JobId, JobFn>,
+    cancel_callback: Option<CancelFn>,
 }
 
 impl JobScheduler {
@@ -58,7 +60,15 @@ impl JobScheduler {
             next_id: 0,
             threadpool: ThreadPool::new(count),
             job_funcs: HashMap::new(),
+            cancel_callback: None,
         }
+    }
+
+    pub fn set_cancel_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(JobId) + Send + 'static,
+    {
+        self.cancel_callback = Some(Box::new(callback));
     }
 
     pub fn add_job<F>(&mut self, deps: Vec<JobId>, func: F, priority: usize) -> JobId
@@ -196,6 +206,10 @@ impl JobScheduler {
             }
 
             println!("Job {} has been canceled", job_id);
+
+            if let Some(ref callback) = self.cancel_callback {
+                callback(job_id);
+            }
         } else {
             println!("Job {} not found", job_id);
         }
