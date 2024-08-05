@@ -1,8 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::time::{Duration, Instant};
+use std::{panic, thread};
 
 type JobId = usize;
 type JobFn = Box<dyn FnOnce() + Send + 'static>;
@@ -13,6 +15,7 @@ struct Job {
     id: JobId,
     deps: HashSet<JobId>,
     priority: usize,
+    timeout: Option<Duration>,
 }
 
 impl Ord for Job {
@@ -71,7 +74,7 @@ impl JobScheduler {
         self.cancel_callback = Some(Box::new(callback));
     }
 
-    pub fn add_job<F>(&mut self, deps: Vec<JobId>, func: F, priority: usize) -> JobId
+    pub fn add_job<F>(&mut self, deps: Vec<JobId>, func: F, priority: usize, timeout: Duration) -> JobId
     where
         F: FnOnce() + Send + 'static,
     {
@@ -81,6 +84,7 @@ impl JobScheduler {
             id,
             deps: deps.into_iter().collect(),
             priority,
+            timeout: Some(timeout),
         };
 
         self.job_statuses
@@ -113,31 +117,40 @@ impl JobScheduler {
             for job in jobs_to_run {
                 if let Some(job_func) = self.job_funcs.remove(&job.id) {
                     let job_statuses = Arc::clone(&self.job_statuses);
+                    let timeout = job.timeout;
                     println!(
                         "Dispatching Job {} (priority {}) to threadpool",
                         job.id, job.priority
                     );
                     self.threadpool.execute(move || {
+                        let start_time = Instant::now();
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                            job_func();
+                        }));
+
+                        let elapsed = start_time.elapsed();
                         {
                             let mut statuses = job_statuses.lock().unwrap();
-                            if let Some(status) = statuses.get_mut(&job.id) {
-                                *status = JobStatus::Running;
+                            if result.is_err() {
+                                statuses.insert(job.id, JobStatus::Failed);
+                            } else if timeout.map_or(false, |t| elapsed > t) {
+                                statuses.insert(job.id, JobStatus::Canceled);
+                            } else {
+                                statuses.insert(job.id, JobStatus::Completed);
                             }
-                            println!("Job {} is now running", job.id);
                         }
-
-                        (job_func)();
-
-                        {
-                            let mut statuses = job_statuses.lock().unwrap();
-                            if let Some(status) = statuses.get_mut(&job.id) {
-                                *status = JobStatus::Completed;
+                        println!(
+                            "Job {} has completed with status: {:?}",
+                            job.id,
+                            if result.is_err() {
+                                "Failed"
+                            } else if timeout.map_or(false, |t| elapsed > t) {
+                                "Canceled"
+                            } else {
+                                "Completed"
                             }
-                            println!("Job {} has completed", job.id);
-                        }
+                        );
                     });
-                } else {
-                    println!("Warning: Job {} function not found", job.id);
                 }
             }
 
@@ -254,7 +267,6 @@ enum Message {
 #[derive(Debug, PartialEq)]
 enum JobStatus {
     Pending,
-    Running,
     Completed,
     Failed,
     Canceled,
