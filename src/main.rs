@@ -2,7 +2,7 @@ mod scheduler;
 
 use scheduler::JobScheduler;
 use std::sync::{Arc, Mutex};
-use std::thread::{self};
+use std::thread;
 use std::time::Duration;
 
 fn main() {
@@ -23,6 +23,7 @@ fn main() {
                 println!("Job 1 running");
                 thread::sleep(Duration::from_secs(2));
                 println!("Job 1 completed");
+                Ok(())
             },
             1,
             Duration::from_secs(5),
@@ -37,6 +38,7 @@ fn main() {
                 println!("Job 2 running");
                 thread::sleep(Duration::from_secs(3));
                 println!("Job 2 completed");
+                Ok(())
             },
             2,
             Duration::from_secs(10),
@@ -51,6 +53,7 @@ fn main() {
                 println!("Job 3 running (depends on Job 1 and Job 2)");
                 thread::sleep(Duration::from_secs(1));
                 println!("Job 3 completed");
+                Err("Job 3 failed".to_string())
             },
             3,
             Duration::from_secs(5),
@@ -65,6 +68,7 @@ fn main() {
                 println!("Job 4 running (depends on Job 3)");
                 thread::sleep(Duration::from_secs(1));
                 println!("Job 4 completed");
+                Ok(())
             },
             1,
             Duration::from_secs(5),

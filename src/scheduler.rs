@@ -3,13 +3,12 @@ use crossbeam::queue::SegQueue;
 use crossbeam::sync::ShardedLock;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 type JobId = usize;
-type JobFn = Box<dyn FnOnce() + Send + 'static>;
+type JobFn = Box<dyn FnOnce() -> Result<(), String> + Send + 'static>;
 type CancelFn = Box<dyn Fn(JobId) + Send + 'static>;
 
 #[derive(Debug, Clone)]
@@ -84,7 +83,7 @@ impl JobScheduler {
         timeout: Duration,
     ) -> JobId
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> Result<(), String> + Send + 'static,
     {
         let id = self.next_id;
         self.next_id += 1;
@@ -132,19 +131,21 @@ impl JobScheduler {
                     );
                     self.threadpool.execute(move || {
                         let start_time = Instant::now();
-                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                            job_func();
-                        }));
+                        let result = job_func();
 
                         let elapsed = start_time.elapsed();
                         {
                             let mut statuses = job_statuses.write().unwrap();
-                            if result.is_err() {
-                                statuses.insert(job.id, JobStatus::Failed);
-                            } else if timeout.map_or(false, |t| elapsed > t) {
-                                statuses.insert(job.id, JobStatus::Canceled);
-                            } else {
-                                statuses.insert(job.id, JobStatus::Completed);
+                            match result {
+                                Err(_) => {
+                                    statuses.insert(job.id, JobStatus::Failed);
+                                }
+                                Ok(_) if timeout.map_or(false, |t| elapsed > t) => {
+                                    statuses.insert(job.id, JobStatus::Canceled);
+                                }
+                                Ok(_) => {
+                                    statuses.insert(job.id, JobStatus::Completed);
+                                }
                             }
                         }
                         println!(
@@ -158,6 +159,8 @@ impl JobScheduler {
                                 "Completed"
                             }
                         );
+                        
+                        result
                     });
                 }
             }
@@ -245,7 +248,7 @@ impl JobScheduler {
                     .write()
                     .unwrap()
                     .insert(job_id, JobStatus::Pending);
-                println!("Retrying Job {} (attempt {})", job_id, *retry_count + 1);
+                println!("Retrying Job {} (attempt {})", job_id, *retry_count);
             } else {
                 self.job_statuses
                     .write()
@@ -291,7 +294,9 @@ impl ThreadPool {
                 match msg {
                     Message::NewJob(job) => {
                         println!("Worker {} received a new job", i);
-                        job()
+                        if let Err(e) = job() {
+                            println!("Worker {} encountered an error: {}", i, e);
+                        }
                     }
                     Message::Terminate => {
                         println!("Worker {} is terminating", i);
@@ -307,7 +312,7 @@ impl ThreadPool {
 
     fn execute<F>(&self, f: F)
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> Result<(), String> + Send + 'static,
     {
         let job = Box::new(f);
         self.sender.send(Message::NewJob(job)).unwrap();
