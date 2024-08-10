@@ -17,11 +17,16 @@ struct Job {
     deps: HashSet<JobId>,
     priority: usize,
     timeout: Option<Duration>,
+    submitted_at: Instant,
 }
 
 impl Ord for Job {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.priority.cmp(&self.priority)
+        // Priority-based ordering, tie-breaking with job ID
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| self.submitted_at.cmp(&other.submitted_at))
     }
 }
 
@@ -38,6 +43,15 @@ impl PartialEq for Job {
 }
 
 impl Eq for Job {}
+
+#[derive(Debug, PartialEq)]
+enum JobStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
 
 pub struct JobScheduler {
     jobs: HashMap<JobId, Job>,
@@ -89,9 +103,10 @@ impl JobScheduler {
         self.next_id += 1;
         let job = Job {
             id,
-            deps: deps.into_iter().collect(),
+            deps: deps.clone().into_iter().collect(),
             priority,
             timeout: Some(timeout),
+            submitted_at: Instant::now(),
         };
 
         self.job_statuses
@@ -99,20 +114,19 @@ impl JobScheduler {
             .unwrap()
             .insert(id, JobStatus::Pending);
 
+        println!(
+            "Added job {}: Priority {}, Dependencies: {:?}",
+            id, job.priority, deps
+        );
+
         if job.deps.is_empty() && !self.ready_job_ids.contains(&id) {
             self.ready_jobs.push(job.clone());
             self.ready_job_ids.insert(id);
-            println!("Job {} (priority {}) is now ready to run", id, job.priority);
+            println!("Job {} is ready to run", id);
         }
+
         self.jobs.insert(id, job.clone());
         self.job_funcs.insert(id, Box::new(func));
-
-        println!(
-            "Added job {}: Priority {}, Status: {:?}",
-            id,
-            job.priority,
-            self.job_statuses.read().unwrap().get(&id)
-        );
 
         id
     }
@@ -125,12 +139,14 @@ impl JobScheduler {
                 if let Some(job_func) = self.job_funcs.remove(&job.id) {
                     let job_statuses = Arc::clone(&self.job_statuses);
                     let timeout = job.timeout;
-                    println!(
-                        "Dispatching Job {} (priority {}) to threadpool",
-                        job.id, job.priority
-                    );
+
                     self.threadpool.execute(move || {
                         let start_time = Instant::now();
+                        {
+                            let mut statuses = job_statuses.write().unwrap();
+                            statuses.insert(job.id, JobStatus::Running);
+                            println!("Job {} status changed to Running", job.id);
+                        }
                         let result = job_func();
 
                         let elapsed = start_time.elapsed();
@@ -139,28 +155,20 @@ impl JobScheduler {
                             match result {
                                 Err(_) => {
                                     statuses.insert(job.id, JobStatus::Failed);
+                                    Err(format!("Job {} status changed to Failed", job.id))
                                 }
                                 Ok(_) if timeout.map_or(false, |t| elapsed > t) => {
                                     statuses.insert(job.id, JobStatus::Canceled);
+                                    println!("Job {} status changed to Canceled", job.id);
+                                    Ok(())
                                 }
                                 Ok(_) => {
                                     statuses.insert(job.id, JobStatus::Completed);
+                                    println!("Job {} status changed to Completed", job.id);
+                                    Ok(())
                                 }
                             }
                         }
-                        println!(
-                            "Job {} has completed with status: {:?}",
-                            job.id,
-                            if result.is_err() {
-                                "Failed"
-                            } else if timeout.map_or(false, |t| elapsed > t) {
-                                "Canceled"
-                            } else {
-                                "Completed"
-                            }
-                        );
-                        
-                        result
                     });
                 }
             }
@@ -203,7 +211,7 @@ impl JobScheduler {
                 self.ready_jobs.push(job.clone());
                 self.ready_job_ids.insert(job.id);
                 println!(
-                    "Job {} (priority {}) is now ready to run",
+                    "Job {} (priority {}) added to ready queue",
                     job.id, job.priority
                 );
             }
@@ -232,6 +240,8 @@ impl JobScheduler {
             if let Some(ref callback) = self.cancel_callback {
                 callback(job_id);
             }
+
+            self.handle_failed_dependencies(job_id);
         } else {
             println!("Job {} not found", job_id);
         }
@@ -259,13 +269,37 @@ impl JobScheduler {
                     job_id, self.max_retries
                 );
             }
+
+            self.handle_failed_dependencies(job_id);
+        } else {
+            self.job_statuses
+                .write()
+                .unwrap()
+                .insert(job_id, JobStatus::Failed);
+            println!("Job {} exceeded retry limit", job_id);
+            self.handle_failed_dependencies(job_id);
         }
     }
-}
 
-struct ThreadPool {
-    workers: Vec<thread::JoinHandle<()>>,
-    sender: Sender<Message>,
+    fn handle_failed_dependencies(&mut self, failed_job_id: JobId) {
+        let mut dependent_jobs = Vec::new();
+
+        for (id, job) in &self.jobs {
+            if job.deps.contains(&failed_job_id) {
+                dependent_jobs.push(id.clone());
+            }
+        }
+
+        for dep_job_id in dependent_jobs {
+            if let Some(_) = self.jobs.get(&dep_job_id) {
+                println!(
+                    "Handling failure of Job {} due to dependency failure of Job {}",
+                    dep_job_id, failed_job_id
+                );
+                self.cancel_job(dep_job_id);
+            }
+        }
+    }
 }
 
 enum Message {
@@ -273,12 +307,9 @@ enum Message {
     Terminate,
 }
 
-#[derive(Debug, PartialEq)]
-enum JobStatus {
-    Pending,
-    Completed,
-    Failed,
-    Canceled,
+struct ThreadPool {
+    workers: Vec<thread::JoinHandle<()>>,
+    sender: Sender<Message>,
 }
 
 impl ThreadPool {
@@ -310,22 +341,26 @@ impl ThreadPool {
         ThreadPool { workers, sender }
     }
 
-    fn execute<F>(&self, f: F)
+    fn execute<F>(&self, job: F)
     where
         F: FnOnce() -> Result<(), String> + Send + 'static,
     {
-        let job = Box::new(f);
-        self.sender.send(Message::NewJob(job)).unwrap();
+        self.sender.send(Message::NewJob(Box::new(job))).unwrap();
+    }
+
+    fn shutdown(&mut self) {
+        for _ in &self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        for _ in &self.workers {
-            self.sender.send(Message::Terminate).unwrap();
-        }
-        for worker in self.workers.drain(..) {
-            worker.join().unwrap();
-        }
+        self.shutdown();
     }
 }
