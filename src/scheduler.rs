@@ -1,6 +1,7 @@
 use crossbeam::channel::{self, Sender};
 use crossbeam::queue::SegQueue;
 use crossbeam::sync::ShardedLock;
+use log::{error, info, warn};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -43,7 +44,7 @@ impl PartialEq for Job {
 
 impl Eq for Job {}
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum JobStatus {
     Pending,
     Running,
@@ -61,6 +62,8 @@ pub struct JobScheduler {
     threadpool: ThreadPool,
     job_funcs: HashMap<JobId, JobFn>,
     cancel_callback: Option<CancelFn>,
+    last_log_time: Instant,
+    log_interval: Duration,
 }
 
 #[allow(dead_code)]
@@ -75,6 +78,8 @@ impl JobScheduler {
             threadpool: ThreadPool::new(count),
             job_funcs: HashMap::new(),
             cancel_callback: None,
+            last_log_time: Instant::now(),
+            log_interval: Duration::from_secs(10),
         }
     }
 
@@ -110,19 +115,17 @@ impl JobScheduler {
             .unwrap()
             .insert(id, JobStatus::Pending);
 
-        println!(
-            "Added job {}: Priority {}, Dependencies: {:?}",
-            id, job.priority, deps
-        );
+        info!("{} {} {:?} {}", id, job.priority, deps, "Added job");
 
         if job.deps.is_empty() && !self.ready_job_ids.contains(&id) {
             self.ready_jobs.push(job.clone());
             self.ready_job_ids.insert(id);
-            println!("Job {} is ready to run", id);
+            info!("{} {}", id, "Job is ready to run");
         }
 
         self.jobs.insert(id, job.clone());
         self.job_funcs.insert(id, Box::new(func));
+        self.log_queue_contents();
 
         id
     }
@@ -130,46 +133,39 @@ impl JobScheduler {
     pub fn run(&mut self) {
         while !self.ready_jobs.is_empty() || !self.jobs.is_empty() {
             let jobs_to_run: Vec<Job> = self.ready_jobs.pop().into_iter().collect();
-
             for job in jobs_to_run {
                 if let Some(job_func) = self.job_funcs.remove(&job.id) {
                     let job_statuses = Arc::clone(&self.job_statuses);
                     let timeout = job.timeout;
-
                     self.threadpool.execute(move || {
                         let start_time = Instant::now();
                         {
                             let mut statuses = job_statuses.write().unwrap();
                             statuses.insert(job.id, JobStatus::Running);
-                            println!("Job {} status changed to Running", job.id);
+                            info!("{} {}", job.id, "Job status changed to Running");
                         }
-                        let result = job_func();
 
+                        let result = job_func();
                         let elapsed = start_time.elapsed();
+                        let status = match result {
+                            Err(_) => JobStatus::Failed,
+                            Ok(_) if timeout.map_or(false, |t| elapsed > t) => JobStatus::Canceled,
+                            Ok(_) => JobStatus::Completed,
+                        };
+
                         {
                             let mut statuses = job_statuses.write().unwrap();
-                            match result {
-                                Err(_) => {
-                                    statuses.insert(job.id, JobStatus::Failed);
-                                    Err(format!("Job {} status changed to Failed", job.id))
-                                }
-                                Ok(_) if timeout.map_or(false, |t| elapsed > t) => {
-                                    statuses.insert(job.id, JobStatus::Canceled);
-                                    println!("Job {} status changed to Canceled", job.id);
-                                    Ok(())
-                                }
-                                Ok(_) => {
-                                    statuses.insert(job.id, JobStatus::Completed);
-                                    println!("Job {} status changed to Completed", job.id);
-                                    Ok(())
-                                }
-                            }
+                            statuses.insert(job.id, status.clone());
+                            info!("{} {:?} {}", job.id, status, "Job status changed");
                         }
+
+                        Ok(())
                     });
                 }
             }
 
             self.update_ready_jobs();
+            self.log_queue_contents();
             thread::yield_now();
         }
 
@@ -183,7 +179,7 @@ impl JobScheduler {
             thread::yield_now();
         }
 
-        println!("All jobs have been completed");
+        info!("All jobs have been completed");
     }
 
     fn update_ready_jobs(&mut self) {
@@ -206,12 +202,11 @@ impl JobScheduler {
             if !self.ready_job_ids.contains(&job.id) {
                 self.ready_jobs.push(job.clone());
                 self.ready_job_ids.insert(job.id);
-                println!(
-                    "Job {} (priority {}) added to ready queue",
-                    job.id, job.priority
-                );
+                info!("{} {} {}", job.id, job.priority, "Job added to ready queue");
             }
         }
+
+        self.log_queue_contents();
     }
 
     pub fn cancel_job(&mut self, job_id: JobId) {
@@ -231,21 +226,21 @@ impl JobScheduler {
                 }
             }
 
-            println!("Job {} has been canceled", job_id);
+            info!("{} {}", job_id, "Job has been canceled");
 
             if let Some(ref callback) = self.cancel_callback {
                 callback(job_id);
             }
 
             self.handle_failed_dependencies(job_id);
+            self.log_queue_contents();
         } else {
-            println!("Job {} not found", job_id);
+            warn!("{} {}", job_id, "Job not found");
         }
     }
 
     fn handle_failed_dependencies(&mut self, failed_job_id: JobId) {
         let mut dependent_jobs = Vec::new();
-
         for (id, job) in &self.jobs {
             if job.deps.contains(&failed_job_id) {
                 dependent_jobs.push(id.clone());
@@ -253,13 +248,34 @@ impl JobScheduler {
         }
 
         for dep_job_id in dependent_jobs {
-            if let Some(_) = self.jobs.get(&dep_job_id) {
-                println!(
-                    "Handling failure of Job {} due to dependency failure of Job {}",
-                    dep_job_id, failed_job_id
+            if let Some(job) = self.jobs.get_mut(&dep_job_id) {
+                warn!(
+                    "{} {} {}",
+                    dep_job_id, failed_job_id, "Handling failure of job due to dependency failure"
                 );
-                self.cancel_job(dep_job_id);
+
+                job.deps.remove(&failed_job_id);
+                if job.deps.is_empty() {
+                    self.ready_jobs.push(job.clone());
+                    self.ready_job_ids.insert(job.id);
+                    info!(
+                        "{} {} {}",
+                        job.id, job.priority, "Job added to ready queue due to failed dependency"
+                    );
+                }
             }
+        }
+
+        self.log_queue_contents();
+    }
+
+    fn log_queue_contents(&mut self) {
+        if Instant::now().duration_since(self.last_log_time) >= self.log_interval {
+            let ready_jobs: Vec<JobId> = self.ready_job_ids.iter().cloned().collect();
+            info!("Queue contents: {:?}", ready_jobs);
+            let statuses = self.job_statuses.read().unwrap();
+            info!("Job statuses: {:?}", *statuses);
+            self.last_log_time = Instant::now();
         }
     }
 }
@@ -286,13 +302,13 @@ impl ThreadPool {
                 let msg = receiver.read().unwrap().recv().unwrap();
                 match msg {
                     Message::NewJob(job) => {
-                        println!("Worker {} received a new job", i);
+                        info!("{} {}", i, "Worker received a new job");
                         if let Err(e) = job() {
-                            println!("Worker {} encountered an error: {}", i, e);
+                            error!("{} {} {}", i, "Worker encountered an error: {}", e);
                         }
                     }
                     Message::Terminate => {
-                        println!("Worker {} is terminating", i);
+                        info!("{} {}", i, "Worker is terminating");
                         break;
                     }
                 }
