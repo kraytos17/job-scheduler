@@ -22,7 +22,6 @@ struct Job {
 
 impl Ord for Job {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Priority-based ordering, tie-breaking with job ID
         other
             .priority
             .cmp(&self.priority)
@@ -56,8 +55,6 @@ enum JobStatus {
 pub struct JobScheduler {
     jobs: HashMap<JobId, Job>,
     job_statuses: Arc<ShardedLock<HashMap<JobId, JobStatus>>>,
-    job_retries: HashMap<JobId, usize>,
-    max_retries: usize,
     ready_jobs: Arc<SegQueue<Job>>,
     ready_job_ids: HashSet<JobId>,
     next_id: JobId,
@@ -66,13 +63,12 @@ pub struct JobScheduler {
     cancel_callback: Option<CancelFn>,
 }
 
+#[allow(dead_code)]
 impl JobScheduler {
-    pub fn new(count: usize, max_retries: usize) -> Self {
+    pub fn new(count: usize) -> Self {
         JobScheduler {
             jobs: HashMap::new(),
             job_statuses: Arc::new(ShardedLock::new(HashMap::new())),
-            job_retries: HashMap::new(),
-            max_retries,
             ready_jobs: Arc::new(SegQueue::new()),
             ready_job_ids: HashSet::new(),
             next_id: 1,
@@ -244,40 +240,6 @@ impl JobScheduler {
             self.handle_failed_dependencies(job_id);
         } else {
             println!("Job {} not found", job_id);
-        }
-    }
-
-    pub fn handle_job_failure(&mut self, job_id: JobId) {
-        let retry_count = self.job_retries.entry(job_id).or_insert(0);
-        if *retry_count < self.max_retries {
-            *retry_count += 1;
-            if let Some(job) = self.jobs.get(&job_id) {
-                self.ready_jobs.push(job.clone());
-                self.ready_job_ids.insert(job_id);
-                self.job_statuses
-                    .write()
-                    .unwrap()
-                    .insert(job_id, JobStatus::Pending);
-                println!("Retrying Job {} (attempt {})", job_id, *retry_count);
-            } else {
-                self.job_statuses
-                    .write()
-                    .unwrap()
-                    .insert(job_id, JobStatus::Failed);
-                println!(
-                    "Job {} has failed after {} retries",
-                    job_id, self.max_retries
-                );
-            }
-
-            self.handle_failed_dependencies(job_id);
-        } else {
-            self.job_statuses
-                .write()
-                .unwrap()
-                .insert(job_id, JobStatus::Failed);
-            println!("Job {} exceeded retry limit", job_id);
-            self.handle_failed_dependencies(job_id);
         }
     }
 
