@@ -1,6 +1,5 @@
 mod scheduler;
 
-use env_logger;
 use log::{info, warn};
 use scheduler::JobScheduler;
 use std::sync::{Arc, Mutex};

@@ -186,7 +186,7 @@ impl JobScheduler {
         let job_statuses = self.job_statuses.read().unwrap();
         let mut new_ready_jobs = Vec::new();
 
-        for (_, job) in &self.jobs {
+        for job in self.jobs.values() {
             if job
                 .deps
                 .iter()
@@ -216,7 +216,7 @@ impl JobScheduler {
                 .unwrap()
                 .insert(job_id, JobStatus::Canceled);
 
-            for (_, job) in &mut self.jobs {
+            for job in self.jobs.values_mut() {
                 if job.deps.contains(&job_id) {
                     job.deps.remove(&job_id);
                     if job.deps.is_empty() {
@@ -243,7 +243,7 @@ impl JobScheduler {
         let mut dependent_jobs = Vec::new();
         for (id, job) in &self.jobs {
             if job.deps.contains(&failed_job_id) {
-                dependent_jobs.push(id.clone());
+                dependent_jobs.push(*id);
             }
         }
 
